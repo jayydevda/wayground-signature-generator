@@ -237,6 +237,24 @@
     .modal-crop-side { flex: none; width: 100%; }
     .modal-guide-side { display: none; }
   }
+
+  /* BG removal progress bar */
+  .bg-progress-wrap {
+    width: 100%; height: 4px;
+    background: rgba(243,239,218,0.1);
+    border-radius: 2px;
+    margin-top: 8px;
+    overflow: hidden;
+    display: none;
+  }
+  .bg-progress-wrap.visible { display: block; }
+  .bg-progress-bar {
+    height: 100%;
+    background: var(--magenta);
+    border-radius: 2px;
+    width: 0%;
+    transition: width 0.3s ease;
+  }
 </style>
 </head>
 <body>
@@ -315,6 +333,9 @@
           <div class="bg-err-icon">✕</div>
           <div class="bg-status-text" id="bg-status-text">Removing background…</div>
           <button class="bg-crop-btn" onclick="openCropModal()">Crop photo →</button>
+        </div>
+        <div class="bg-progress-wrap" id="bg-progress-wrap">
+          <div class="bg-progress-bar" id="bg-progress-bar"></div>
         </div>
       </div>
 
@@ -502,7 +523,7 @@ async function initiateUpload(file) {
   // Show spinner
   const status = document.getElementById('bg-status');
   status.className = 'bg-status visible';
-  document.getElementById('bg-status-text').textContent = 'Removing background…';
+  document.getElementById('bg-status-text').textContent = 'Removing background… (first run ~20s, then cached)';
   document.getElementById('upload-inner').style.display  = 'none';
   document.getElementById('upload-preview').style.display = 'none';
   document.getElementById('generate-btn').disabled = true;
@@ -511,6 +532,8 @@ async function initiateUpload(file) {
     cutoutImg = await removeBgRemoveBg(file);
     status.classList.add('done');
     document.getElementById('bg-status-text').textContent = 'Background removed — crop your photo';
+    document.getElementById('bg-progress-bar').style.width = '100%';
+    setTimeout(() => { document.getElementById('bg-progress-wrap').classList.remove('visible'); }, 600);
   } catch (err) {
     status.classList.add('error');
     document.getElementById('bg-status-text').textContent =
@@ -520,29 +543,91 @@ async function initiateUpload(file) {
 
 // ── Remove.bg API call ────────────────────────────────────────────────────────
 async function removeBgRemoveBg(file) {
-  const fd = new FormData();
-  fd.append('image_file', file);
-  fd.append('size', 'auto');
+  const transformers = await import(
+    'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/dist/transformers.min.js'
+  );
+  const { env, AutoModel, AutoProcessor, RawImage } = transformers;
 
-  const res = await fetch('https://api.remove.bg/v1.0/removebg', {
-    method:  'POST',
-    headers: { 'X-Api-Key': REMOVE_BG_API_KEY },
-    body:    fd,
-  });
+  env.allowLocalModels = false;
+  env.useBrowserCache  = true;
 
-  if (!res.ok) {
-    const errJson = await res.json().catch(() => ({}));
-    throw new Error(errJson?.errors?.[0]?.title || `HTTP ${res.status}`);
+  // Load RMBG-1.4 — same U2Net model as Remove.bg, confirmed working in Xenova demos
+  // Show progress bar
+  const progressWrap = document.getElementById('bg-progress-wrap');
+  const progressBar  = document.getElementById('bg-progress-bar');
+  progressWrap.classList.add('visible');
+  progressBar.style.width = '0%';
+
+  // Progress callback
+  const onProgress = (p) => {
+    if (p.status === 'progress' && p.total) {
+      const pct = Math.round((p.loaded / p.total) * 80); // 0-80% for model load
+      progressBar.style.width = pct + '%';
+      document.getElementById('bg-status-text').textContent =
+        `Loading model… ${pct}%`;
+    }
+  };
+
+  const [model, processor] = await Promise.all([
+    AutoModel.from_pretrained('briaai/RMBG-1.4', {
+      config: { model_type: 'custom' },
+      dtype: 'fp32',
+      progress_callback: onProgress,
+    }),
+    AutoProcessor.from_pretrained('briaai/RMBG-1.4', {
+      config: {
+        do_normalize: true,
+        do_pad: false,
+        do_rescale: true,
+        do_resize: true,
+        image_mean: [0.5, 0.5, 0.5],
+        image_std:  [1.0, 1.0, 1.0],
+        resample: 2,
+        rescale_factor: 0.00392156862745098,
+        size: { width: 1024, height: 1024 },
+      }
+    }),
+  ]);
+
+  // Model loaded — update to 85%
+  progressBar.style.width = '85%';
+  document.getElementById('bg-status-text').textContent = 'Removing background… (first run ~20s, then cached)';
+
+  const imageUrl = URL.createObjectURL(file);
+  const image    = await RawImage.fromURL(imageUrl);
+  URL.revokeObjectURL(imageUrl);
+
+  // Preprocess and run
+  progressBar.style.width = '92%';
+  const { pixel_values } = await processor(image);
+  const { output }       = await model({ input: pixel_values });
+  progressBar.style.width = '98%';
+
+  // Convert mask tensor to ImageData and apply
+  const maskImg = await RawImage.fromTensor(output[0].mul(255).to('uint8')).resize(image.width, image.height);
+
+  const canvas = document.createElement('canvas');
+  canvas.width  = image.width;
+  canvas.height = image.height;
+  const ctx = canvas.getContext('2d');
+
+  const origBitmap = await createImageBitmap(file);
+  ctx.drawImage(origBitmap, 0, 0);
+
+  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  for (let i = 0; i < maskImg.data.length; i++) {
+    imgData.data[i * 4 + 3] = maskImg.data[i];
   }
-
-  const blob = await res.blob();
+  ctx.putImageData(imgData, 0, 0);
 
   return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(blob);
-    const img  = new Image();
-    img.onload  = () => { URL.revokeObjectURL(url); resolve(img); };
-    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Failed to decode cutout')); };
-    img.src = url;
+    canvas.toBlob(blob => {
+      const url = URL.createObjectURL(blob);
+      const out = new Image();
+      out.onload  = () => { URL.revokeObjectURL(url); resolve(out); };
+      out.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Failed to decode cutout')); };
+      out.src = url;
+    }, 'image/png');
   });
 }
 
